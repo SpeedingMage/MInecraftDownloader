@@ -132,6 +132,46 @@ class Plan:
         return sum(file.size or 0 for file in self.files)
 
 
+@dataclasses.dataclass(frozen=True)
+class InstallLayout:
+    """Resolved destinations shared by the UI preview and installation worker."""
+    game_root: Path
+    archive_dir: Path
+    lock_file: Path
+    incremental: bool
+
+
+def install_layout(output: Path, version: str) -> InstallLayout:
+    """Treat a selected .minecraft directory as the game root, ignoring case."""
+    if "/" in safe_relative(version):
+        raise ValueError("版本 ID 不能包含路径分隔符")
+    selected = output.expanduser()
+    incremental = selected.name.casefold() == ".minecraft"
+    selected = selected.resolve()
+    if incremental:
+        return InstallLayout(selected, destination(selected, "downloader-exports"),
+                             destination(selected, ".minecraft-downloader.lock"), True)
+    instance = destination(selected, f"Minecraft-{safe_relative(version)}")
+    return InstallLayout(destination(instance, ".minecraft"), selected,
+                         destination(instance, "download.lock"), False)
+
+
+def check_existing_manifest(plan: Plan, root: Path) -> None:
+    """Refuse to replace a modified/modded instance with an official vanilla one."""
+    relative = f"versions/{plan.version}/{plan.version}.json"
+    path = destination(root, relative)
+    if not path.exists():
+        return
+    try:
+        current = json.loads(path.read_text(encoding="utf-8-sig"))
+        expected = json.loads(plan.generated[relative])
+    except (OSError, ValueError) as error:
+        raise ValueError(f"已有版本清单无法确认，已停止以保护原文件：{path}") from error
+    if current != expected:
+        raise ValueError(f"已有同名版本包含不同或自定义的配置，已停止以保护原实例：{path}。"
+                         "请选择普通文件夹单独下载，或使用其他版本。")
+
+
 class Network:
     """Each worker gets its own opener, honoring system or explicit HTTP proxy."""
 
@@ -448,16 +488,16 @@ def package_instance(plan: Plan, root: Path, output: Path, cancel: threading.Eve
 
 def install(plan: Plan, output: Path, network: Network, cancel: threading.Event,
             emit: Event = lambda *_: None, workers: int = 8, pack: bool = True) -> tuple[Path, Path | None]:
-    output = output.resolve()
-    root = destination(output, f"Minecraft-{plan.version}/.minecraft")
-    output.mkdir(parents=True, exist_ok=True)
+    layout = install_layout(output, plan.version)
+    root = layout.game_root
     if not 1 <= workers <= 16:
         raise ValueError("并发数必须在 1 到 16 之间")
-    with output_lock(destination(output, f"Minecraft-{plan.version}/download.lock")):
+    check_cancel(cancel)
+    with output_lock(layout.lock_file):
         root.mkdir(parents=True, exist_ok=True)
-        for relative, data in plan.generated.items():
-            check_cancel(cancel)
-            atomic_write(destination(root, relative), data)
+        check_existing_manifest(plan, root)
+        emit("layout", (root, layout.archive_dir, layout.incremental))
+        emit("log", f"{'游戏目录增量模式' if layout.incremental else '独立实例模式'}：{root}")
         emit("total", (len(plan.files), plan.total_bytes))
         completed = reused = transferred = 0
         # Keep only a small bounded window of pending work, even for huge indexes.
@@ -497,6 +537,9 @@ def install(plan: Plan, output: Path, network: Network, cancel: threading.Event,
             target = destination(root, relative)
             target.parent.mkdir(parents=True, exist_ok=True)
             source = destination(root, original)
+            if target.is_file() and target.stat().st_size == source.stat().st_size:
+                if digest_file(target, cancel) == digest_file(source, cancel):
+                    continue
             temporary = destination(root, relative + ".part")
             try:
                 with source.open("rb") as src, temporary.open("wb") as dst:
@@ -506,6 +549,19 @@ def install(plan: Plan, output: Path, network: Network, cancel: threading.Event,
                 os.replace(temporary, target)
             finally:
                 temporary.unlink(missing_ok=True)
+        check_cancel(cancel)
+        # Publish the version only after all game files have passed verification.
+        # Check again in case another program changed its metadata during download.
+        check_existing_manifest(plan, root)
+        version_json = f"versions/{plan.version}/{plan.version}.json"
+        for relative, data in plan.generated.items():
+            check_cancel(cancel)
+            path = destination(root, relative)
+            if path.is_file() and (relative == version_json or path.read_bytes() == data):
+                continue
+            atomic_write(path, data)
         emit("log", f"下载完成：{completed} 个文件，其中 {reused} 个复用已校验文件。")
-        archive = package_instance(plan, root, output, cancel, emit) if pack else None
+        if pack:
+            layout.archive_dir.mkdir(parents=True, exist_ok=True)
+        archive = package_instance(plan, root, layout.archive_dir, cancel, emit) if pack else None
         return root, archive

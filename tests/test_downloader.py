@@ -1,5 +1,7 @@
 """Deterministic local-server integration tests; no game accounts or remote APIs."""
 from concurrent.futures import ThreadPoolExecutor
+import copy
+import dataclasses
 import hashlib
 import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +15,7 @@ import unittest
 from unittest.mock import patch
 import zipfile
 import urllib.error
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import downloader as d
@@ -143,6 +146,86 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(len(self.requests), count + 1)
         self.assertEqual(d.digest_file(file), plan.files[0].sha1)
 
+    def test_incremental_game_directory_repairs_only_missing_and_bad_files(self):
+        plan, _ = self.fixture()
+        root = self.output / ".minecraft"
+        root.mkdir()
+        for item in plan.files:
+            path = d.destination(root, item.relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(self.payloads[urlparse(item.url).path])
+        # Seed a real-looking existing directory, including a reformatted manifest.
+        version_path = root / "versions/test-1/test-1.json"
+        original_manifest = json.dumps(plan.manifest, indent=4).encode()
+        version_path.write_bytes(original_manifest)
+        protected = {"saves/world/level.dat": b"world", "mods/custom.jar": b"mod",
+                     "accounts.json": b"private", "options.txt": b"settings",
+                     "versions/other/other.json": b"other version"}
+        for relative, content in protected.items():
+            path = d.destination(root, relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        missing, corrupt = plan.files[:2]
+        (root / missing.relative).unlink()
+        (root / corrupt.relative).write_bytes(b"X" * corrupt.size)
+        count = len(self.requests)
+        events = []
+        actual, archive = d.install(plan, root, self.network, self.cancel,
+                                    lambda *event: events.append(event), workers=2)
+        self.assertEqual(actual, root)
+        self.assertEqual(len(self.requests) - count, 2)
+        self.assertEqual(archive.parent, root / "downloader-exports")
+        self.assertFalse((root / "Minecraft-test-1").exists())
+        self.assertEqual(version_path.read_bytes(), original_manifest)
+        progress = [value for kind, value in events if kind == "progress"]
+        self.assertEqual(progress[-1][3], len(plan.files) - 2)
+        for relative, content in protected.items():
+            self.assertEqual((root / relative).read_bytes(), content)
+        with zipfile.ZipFile(archive) as zipped:
+            for relative in protected:
+                self.assertNotIn(".minecraft/" + relative, zipped.namelist())
+
+    def test_two_versions_share_verified_libraries_and_assets(self):
+        plan, _ = self.fixture()
+        root = self.output / ".minecraft"
+        d.install(plan, root, self.network, self.cancel, pack=False)
+        manifest = copy.deepcopy(plan.manifest)
+        manifest["id"] = "test-2"
+        files = [dataclasses.replace(item, relative=item.relative.replace("versions/test-1/test-1.jar", "versions/test-2/test-2.jar")) for item in plan.files]
+        generated = {key: value for key, value in plan.generated.items() if not key.startswith("versions/")}
+        generated["versions/test-2/test-2.json"] = json.dumps(manifest).encode()
+        other = d.Plan("test-2", manifest, files, generated, plan.aliases)
+        count = len(self.requests)
+        d.install(other, root, self.network, self.cancel, pack=False)
+        self.assertEqual(len(self.requests) - count, 1)
+        self.assertTrue((root / "versions/test-1/test-1.json").exists())
+        self.assertTrue((root / "versions/test-2/test-2.json").exists())
+        self.assertEqual(d.install_layout(root, "test-1").lock_file,
+                         d.install_layout(root, "test-2").lock_file)
+
+    def test_modified_manifest_is_preserved_before_download(self):
+        plan, _ = self.fixture()
+        root = self.output / ".minecraft"
+        version = root / "versions/test-1/test-1.json"
+        version.parent.mkdir(parents=True)
+        raw = b'{"id":"test-1","mainClass":"custom.ModLoader"}'
+        version.write_bytes(raw)
+        count = len(self.requests)
+        with self.assertRaisesRegex(ValueError, "自定义"):
+            d.install(plan, root, self.network, self.cancel)
+        self.assertEqual(len(self.requests), count)
+        self.assertEqual(version.read_bytes(), raw)
+        self.assertFalse((root / "versions/test-1/test-1.jar").exists())
+
+    def test_layout_keeps_ordinary_output_and_ignores_directory_name_case(self):
+        direct = d.install_layout(self.output / ".MineCraft", "test-1")
+        self.assertTrue(direct.incremental)
+        self.assertEqual(direct.game_root, self.output / ".MineCraft")
+        ordinary = d.install_layout(self.output / "Games", "test-1")
+        self.assertFalse(ordinary.incremental)
+        self.assertEqual(ordinary.game_root, self.output / "Games/Minecraft-test-1/.minecraft")
+        self.assertEqual(ordinary.archive_dir, self.output / "Games")
+
     def test_bad_hash_never_replaces_existing_file(self):
         root = self.output
         (root / "target.jar").write_bytes(b"previous valid content")
@@ -221,6 +304,7 @@ class DownloaderTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             d.install(plan, self.output, self.network, self.cancel, workers=2)
         self.assertFalse(list(self.output.glob("*.zip")))
+        self.assertFalse((self.output / "Minecraft-test-1/.minecraft/versions/test-1/test-1.json").exists())
 
     def test_output_lock_excludes_other_worker(self):
         path = self.output / "download.lock"
